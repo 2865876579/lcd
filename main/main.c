@@ -1,208 +1,467 @@
-#include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 
-#include "avatar_frames.h"
+#include "avatar_rgb666_frames.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
-#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lcd_ili9488.h"
-#include "lvgl.h"
 
-#if LV_COLOR_DEPTH != 16
-#error "This display bridge expects LVGL LV_COLOR_DEPTH=16"
+#define DIRECT_DRAW_LINES 24
+#define ANIMATION_TASK_STACK 4096
+#define ANIMATION_TASK_PRIORITY 2
+#define ENABLE_LOWER_PARTICLES 1
+#define LOWER_PARTICLE_X 30
+#define LOWER_PARTICLE_Y 270
+#define LOWER_PARTICLE_W 260
+#define LOWER_PARTICLE_H 190
+#define LOWER_PARTICLE_REFRESH_DIV 3
+#define LOWER_PARTICLE_WAVE_PERIOD 128
+#define ENABLE_AMBIENT_FX 0
+
+#if ENABLE_AMBIENT_FX
+#define AMBIENT_TILE_MAX 48
+#define AMBIENT_WAVE_PERIOD 128
+#define AMBIENT_FX_PER_STEP 2
 #endif
 
-#define LVGL_DRAW_BUF_LINES 24
-#define LVGL_TICK_MS 2
-#define ANIM_TIMER_MS 40
-#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+static const char *TAG = "screen_anim";
 
-static const char *TAG = "screen_lvgl";
-
-static lv_disp_draw_buf_t s_draw_buf;
-static lv_disp_drv_t s_disp_drv;
-static lv_color_t *s_draw_buf_1;
-static uint8_t *s_flush_buf;
-static esp_timer_handle_t s_lvgl_tick_timer;
-static lv_obj_t *s_avatar_frame_img;
-
-static const lv_img_dsc_t *const s_avatar_frames[] = {
-    &avatar_frame_0,
-    &avatar_frame_1,
-    &avatar_frame_2,
-    &avatar_frame_3,
-    &avatar_frame_4,
-    &avatar_frame_5,
-    &avatar_frame_6,
-    &avatar_frame_7,
-    &avatar_frame_8,
-    &avatar_frame_9,
-    &avatar_frame_10,
-    &avatar_frame_11,
+static const uint16_t s_frame_durations_ms[AVATAR_HEAD_FRAME_COUNT] = {
+    420, 170, 170, 180, 180, 180, 120, 130, 170, 180, 180, 420,
 };
 
-static uint8_t rgb5_to_rgb666_byte(uint8_t value)
+static uint8_t *s_tx_buf;
+
+#if ENABLE_LOWER_PARTICLES
+typedef struct {
+    int16_t x;
+    int16_t y;
+    int8_t drift_x;
+    int8_t drift_y;
+    uint8_t radius;
+    uint8_t phase;
+    uint8_t strength;
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+} lower_particle_t;
+
+static const lower_particle_t s_lower_particles[] = {
+    {.x = 52, .y = 292, .drift_x = 12, .drift_y = 7, .radius = 6, .phase = 0, .strength = 166, .r = 255, .g = 136, .b = 64},
+    {.x = 270, .y = 306, .drift_x = -11, .drift_y = 8, .radius = 5, .phase = 17, .strength = 154, .r = 210, .g = 76, .b = 255},
+    {.x = 68, .y = 344, .drift_x = 10, .drift_y = -9, .radius = 5, .phase = 31, .strength = 152, .r = 70, .g = 176, .b = 255},
+    {.x = 260, .y = 356, .drift_x = -12, .drift_y = 8, .radius = 6, .phase = 45, .strength = 160, .r = 255, .g = 92, .b = 170},
+    {.x = 88, .y = 404, .drift_x = 10, .drift_y = -10, .radius = 6, .phase = 62, .strength = 148, .r = 245, .g = 88, .b = 230},
+    {.x = 236, .y = 420, .drift_x = -11, .drift_y = -9, .radius = 5, .phase = 78, .strength = 154, .r = 78, .g = 142, .b = 255},
+    {.x = 42, .y = 376, .drift_x = 8, .drift_y = 6, .radius = 4, .phase = 96, .strength = 142, .r = 255, .g = 114, .b = 206},
+    {.x = 278, .y = 452, .drift_x = -8, .drift_y = 8, .radius = 4, .phase = 112, .strength = 146, .r = 255, .g = 154, .b = 70},
+    {.x = 118, .y = 454, .drift_x = 8, .drift_y = -7, .radius = 4, .phase = 52, .strength = 140, .r = 82, .g = 214, .b = 232},
+    {.x = 212, .y = 322, .drift_x = -8, .drift_y = 9, .radius = 4, .phase = 86, .strength = 142, .r = 178, .g = 72, .b = 255},
+};
+
+static uint8_t clamp_rgb666_channel(int value)
 {
-    uint8_t six_bit = (uint8_t)((value << 1) | (value >> 4));
-    return (uint8_t)(six_bit << 2);
+    if (value < 0) {
+        return 0;
+    }
+    if (value > 252) {
+        return 252;
+    }
+    return (uint8_t)(value & 0xFC);
 }
 
-static uint8_t rgb6_to_rgb666_byte(uint8_t value)
+static int particle_wave_offset(uint32_t tick, uint8_t phase, int amplitude)
 {
-    return (uint8_t)(value << 2);
+    const int p = (int)((tick + phase) & (LOWER_PARTICLE_WAVE_PERIOD - 1));
+    const int half = LOWER_PARTICLE_WAVE_PERIOD / 2;
+    const int triangle = p < half ? p : LOWER_PARTICLE_WAVE_PERIOD - p;
+    return ((triangle * 2 - half) * amplitude) / half;
 }
 
-static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map)
+static void add_particle_pixel(uint8_t *pixel, const lower_particle_t *particle, int alpha)
 {
-    const int32_t src_w = area->x2 - area->x1 + 1;
-    int32_t x1 = area->x1;
-    int32_t y1 = area->y1;
-    int32_t x2 = area->x2;
-    int32_t y2 = area->y2;
-
-    if (x2 < 0 || y2 < 0 || x1 >= LCD_ILI9488_H_RES || y1 >= LCD_ILI9488_V_RES) {
-        lv_disp_flush_ready(drv);
+    if (alpha <= 0) {
         return;
     }
-
-    if (x1 < 0) {
-        x1 = 0;
-    }
-    if (y1 < 0) {
-        y1 = 0;
-    }
-    if (x2 >= LCD_ILI9488_H_RES) {
-        x2 = LCD_ILI9488_H_RES - 1;
-    }
-    if (y2 >= LCD_ILI9488_V_RES) {
-        y2 = LCD_ILI9488_V_RES - 1;
+    if (alpha > 230) {
+        alpha = 230;
     }
 
-    const int w = (int)(x2 - x1 + 1);
-    const int h = (int)(y2 - y1 + 1);
-    const size_t pixel_count = (size_t)w * h;
-    if (pixel_count > (size_t)LCD_ILI9488_H_RES * LVGL_DRAW_BUF_LINES) {
-        ESP_LOGE(TAG, "flush area too large: %dx%d", w, h);
-        lv_disp_flush_ready(drv);
-        return;
+    pixel[0] = clamp_rgb666_channel(pixel[0] + ((int)particle->r - pixel[0]) * alpha / 255);
+    pixel[1] = clamp_rgb666_channel(pixel[1] + ((int)particle->g - pixel[1]) * alpha / 255);
+    pixel[2] = clamp_rgb666_channel(pixel[2] + ((int)particle->b - pixel[2]) * alpha / 255);
+}
+
+static void overlay_lower_particles(int chunk_x, int chunk_y, int w, int lines, uint32_t tick)
+{
+    for (size_t i = 0; i < sizeof(s_lower_particles) / sizeof(s_lower_particles[0]); i++) {
+        const lower_particle_t *particle = &s_lower_particles[i];
+        const int cx = particle->x + particle_wave_offset(tick, particle->phase, particle->drift_x);
+        const int cy = particle->y + particle_wave_offset(tick, (uint8_t)(particle->phase + 37), particle->drift_y);
+        const int radius = particle->radius;
+        const int r2 = radius * radius;
+
+        int x0 = cx - radius;
+        int x1 = cx + radius;
+        int y0 = cy - radius;
+        int y1 = cy + radius;
+
+        if (x0 < chunk_x) {
+            x0 = chunk_x;
+        }
+        if (x1 >= chunk_x + w) {
+            x1 = chunk_x + w - 1;
+        }
+        if (y0 < chunk_y) {
+            y0 = chunk_y;
+        }
+        if (y1 >= chunk_y + lines) {
+            y1 = chunk_y + lines - 1;
+        }
+        if (x0 > x1 || y0 > y1) {
+            continue;
+        }
+
+        const int pulse = particle_wave_offset(tick, (uint8_t)(particle->phase + 19), particle->strength / 2);
+        const int intensity = particle->strength + pulse;
+        for (int py = y0; py <= y1; py++) {
+            for (int px = x0; px <= x1; px++) {
+                const int dx = px - cx;
+                const int dy = py - cy;
+                const int dist = dx * dx + dy * dy;
+                if (dist > r2) {
+                    continue;
+                }
+
+                int alpha = (r2 - dist) * intensity / (r2 + 1);
+                if (dist <= 1) {
+                    alpha += intensity / 2;
+                }
+                const size_t offset = (((size_t)(py - chunk_y) * w) + (px - chunk_x)) * 3;
+                add_particle_pixel(&s_tx_buf[offset], particle, alpha);
+            }
+        }
+    }
+}
+#endif
+
+#if ENABLE_AMBIENT_FX
+typedef enum {
+    AMBIENT_FX_BREATH,
+    AMBIENT_FX_PARTICLE,
+} ambient_fx_kind_t;
+
+typedef struct {
+    int x;
+    int y;
+    int size;
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+    uint8_t phase;
+    int8_t drift_x;
+    int8_t drift_y;
+    uint8_t strength;
+    ambient_fx_kind_t kind;
+} ambient_fx_t;
+
+static const ambient_fx_t s_ambient_fx[] = {
+    {.x = 2, .y = 118, .size = 34, .r = 255, .g = 238, .b = 214, .phase = 0, .drift_x = 0, .drift_y = 1, .strength = 20, .kind = AMBIENT_FX_BREATH},
+    {.x = 284, .y = 286, .size = 34, .r = 255, .g = 236, .b = 210, .phase = 44, .drift_x = 0, .drift_y = -1, .strength = 18, .kind = AMBIENT_FX_BREATH},
+    {.x = 16, .y = 78, .size = 7, .r = 255, .g = 246, .b = 220, .phase = 8, .drift_x = 3, .drift_y = 2, .strength = 96, .kind = AMBIENT_FX_PARTICLE},
+    {.x = 296, .y = 102, .size = 6, .r = 255, .g = 232, .b = 204, .phase = 22, .drift_x = -2, .drift_y = 3, .strength = 86, .kind = AMBIENT_FX_PARTICLE},
+    {.x = 28, .y = 226, .size = 8, .r = 255, .g = 242, .b = 218, .phase = 36, .drift_x = 2, .drift_y = -3, .strength = 82, .kind = AMBIENT_FX_PARTICLE},
+    {.x = 288, .y = 220, .size = 7, .r = 255, .g = 238, .b = 210, .phase = 50, .drift_x = -2, .drift_y = 2, .strength = 90, .kind = AMBIENT_FX_PARTICLE},
+    {.x = 56, .y = 332, .size = 9, .r = 255, .g = 248, .b = 226, .phase = 64, .drift_x = 3, .drift_y = -2, .strength = 76, .kind = AMBIENT_FX_PARTICLE},
+    {.x = 250, .y = 356, .size = 8, .r = 255, .g = 236, .b = 212, .phase = 78, .drift_x = -3, .drift_y = -2, .strength = 84, .kind = AMBIENT_FX_PARTICLE},
+    {.x = 98, .y = 420, .size = 6, .r = 255, .g = 248, .b = 228, .phase = 92, .drift_x = 2, .drift_y = -3, .strength = 78, .kind = AMBIENT_FX_PARTICLE},
+    {.x = 198, .y = 410, .size = 7, .r = 255, .g = 238, .b = 214, .phase = 110, .drift_x = -2, .drift_y = -2, .strength = 80, .kind = AMBIENT_FX_PARTICLE},
+};
+
+enum {
+    AMBIENT_FX_COUNT = sizeof(s_ambient_fx) / sizeof(s_ambient_fx[0]),
+};
+
+static uint32_t s_ambient_ticks[AMBIENT_FX_COUNT];
+#endif
+
+static esp_err_t draw_rgb666_rect(int x, int y, int w, int h,
+                                  const uint8_t *pixels, int src_stride,
+                                  uint32_t particle_tick)
+{
+    for (int row = 0; row < h; row += DIRECT_DRAW_LINES) {
+        int lines = h - row;
+        if (lines > DIRECT_DRAW_LINES) {
+            lines = DIRECT_DRAW_LINES;
+        }
+
+        const size_t len = (size_t)w * lines * 3;
+        const uint8_t *src = pixels + ((size_t)row * src_stride * 3);
+        if (src_stride == w) {
+            memcpy(s_tx_buf, src, len);
+        } else {
+            uint8_t *dst = s_tx_buf;
+            for (int line = 0; line < lines; line++) {
+                memcpy(dst, src + ((size_t)line * src_stride * 3), (size_t)w * 3);
+                dst += (size_t)w * 3;
+            }
+        }
+#if ENABLE_LOWER_PARTICLES
+        if (particle_tick != UINT32_MAX) {
+            overlay_lower_particles(x, y + row, w, lines, particle_tick);
+        }
+#else
+        (void)particle_tick;
+#endif
+        ESP_RETURN_ON_ERROR(lcd_ili9488_draw_rgb666_image(x, y + row, w, lines, s_tx_buf),
+                            TAG, "draw image chunk");
     }
 
-    uint8_t *dst = s_flush_buf;
+    return ESP_OK;
+}
+
+#if ENABLE_AMBIENT_FX
+static uint8_t clamp_rgb666(int value)
+{
+    if (value < 0) {
+        return 0;
+    }
+    if (value > 252) {
+        return 252;
+    }
+    return (uint8_t)(value & 0xFC);
+}
+
+static void copy_base_tile(int x, int y, int w, int h)
+{
+    uint8_t *dst = s_tx_buf;
     for (int row = 0; row < h; row++) {
-        const lv_color_t *src = color_map +
-                                ((size_t)(y1 - area->y1 + row) * src_w) +
-                                (x1 - area->x1);
-        for (int col = 0; col < w; col++) {
-            *dst++ = rgb5_to_rgb666_byte(LV_COLOR_GET_R(src[col]));
-            *dst++ = rgb6_to_rgb666_byte(LV_COLOR_GET_G(src[col]));
-            *dst++ = rgb5_to_rgb666_byte(LV_COLOR_GET_B(src[col]));
+        const uint8_t *src = avatar_base_rgb666 + (((size_t)(y + row) * LCD_ILI9488_H_RES + x) * 3);
+        memcpy(dst, src, (size_t)w * 3);
+        dst += (size_t)w * 3;
+    }
+}
+
+static int wave_offset(uint32_t tick, uint8_t phase, int amplitude)
+{
+    const int p = (int)((tick + phase) & (AMBIENT_WAVE_PERIOD - 1));
+    const int half = AMBIENT_WAVE_PERIOD / 2;
+    const int triangle = p < half ? p : AMBIENT_WAVE_PERIOD - p;
+    return ((triangle * 2 - half) * amplitude) / half;
+}
+
+static void ambient_position(const ambient_fx_t *fx, uint32_t tick, int *x, int *y)
+{
+    const int size = fx->size > AMBIENT_TILE_MAX ? AMBIENT_TILE_MAX : fx->size;
+    int px = fx->x + wave_offset(tick, fx->phase, fx->drift_x);
+    int py = fx->y + wave_offset(tick, (uint8_t)(fx->phase + 17), fx->drift_y);
+
+    if (px < 0) {
+        px = 0;
+    } else if (px + size > LCD_ILI9488_H_RES) {
+        px = LCD_ILI9488_H_RES - size;
+    }
+    if (py < 0) {
+        py = 0;
+    } else if (py + size > LCD_ILI9488_V_RES) {
+        py = LCD_ILI9488_V_RES - size;
+    }
+
+    *x = px;
+    *y = py;
+}
+
+static void add_glow_pixel(uint8_t *pixel, uint8_t r, uint8_t g, uint8_t b, int alpha)
+{
+    if (alpha <= 0) {
+        return;
+    }
+    if (alpha > 255) {
+        alpha = 255;
+    }
+
+    pixel[0] = clamp_rgb666(pixel[0] + ((int)r - pixel[0]) * alpha / 255);
+    pixel[1] = clamp_rgb666(pixel[1] + ((int)g - pixel[1]) * alpha / 255);
+    pixel[2] = clamp_rgb666(pixel[2] + ((int)b - pixel[2]) * alpha / 255);
+}
+
+static esp_err_t draw_ambient_fx(const ambient_fx_t *fx, uint32_t tick)
+{
+    const int size = fx->size > AMBIENT_TILE_MAX ? AMBIENT_TILE_MAX : fx->size;
+    int screen_x;
+    int screen_y;
+    ambient_position(fx, tick, &screen_x, &screen_y);
+
+    const int cx = size / 2;
+    const int cy = size / 2;
+    const uint32_t phase = (tick + fx->phase) & (AMBIENT_WAVE_PERIOD - 1);
+    const uint32_t half = AMBIENT_WAVE_PERIOD / 2;
+    const int pulse = phase < half ? (int)phase : (int)(AMBIENT_WAVE_PERIOD - phase);
+    int intensity = fx->strength;
+    const int radius = size / 2;
+    const int outer = radius * radius;
+
+    if (fx->kind == AMBIENT_FX_BREATH) {
+        intensity += pulse * fx->strength / (int)(half * 2);
+    } else {
+        intensity += pulse * fx->strength / (int)(half * 3);
+    }
+
+    copy_base_tile(screen_x, screen_y, size, size);
+
+    for (int y = 0; y < size; y++) {
+        for (int x = 0; x < size; x++) {
+            const int dx = x - cx;
+            const int dy = y - cy;
+            const int dist = dx * dx + dy * dy;
+            int alpha = 0;
+
+            if (dist <= outer) {
+                alpha = (outer - dist) * intensity / (outer + 1);
+            }
+            if (fx->kind == AMBIENT_FX_PARTICLE && dist <= 1) {
+                alpha += intensity / 2;
+            }
+
+            add_glow_pixel(&s_tx_buf[((size_t)y * size + x) * 3], fx->r, fx->g, fx->b, alpha);
         }
     }
 
-    esp_err_t err = lcd_ili9488_draw_rgb666_image((int)x1, (int)y1, w, h, s_flush_buf);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "flush failed: %s", esp_err_to_name(err));
-    }
-
-    lv_disp_flush_ready(drv);
+    return lcd_ili9488_draw_rgb666_image(screen_x, screen_y, size, size, s_tx_buf);
 }
 
-static void lvgl_tick_cb(void *arg)
+static esp_err_t restore_ambient_fx(const ambient_fx_t *fx, uint32_t tick)
+{
+    const int size = fx->size > AMBIENT_TILE_MAX ? AMBIENT_TILE_MAX : fx->size;
+    int x;
+    int y;
+    ambient_position(fx, tick, &x, &y);
+    copy_base_tile(x, y, size, size);
+    return lcd_ili9488_draw_rgb666_image(x, y, size, size, s_tx_buf);
+}
+
+static void draw_ambient_frame(uint32_t tick)
+{
+    for (size_t i = 0; i < sizeof(s_ambient_fx) / sizeof(s_ambient_fx[0]); i++) {
+        esp_err_t err = draw_ambient_fx(&s_ambient_fx[i], tick);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "ambient fx %u failed: %s", (unsigned)i, esp_err_to_name(err));
+        }
+    }
+}
+#endif
+
+static void animation_task(void *arg)
 {
     (void)arg;
-    lv_tick_inc(LVGL_TICK_MS);
-}
 
-static esp_err_t lvgl_port_init(void)
-{
-    lv_init();
-
-    const size_t pixel_count = LCD_ILI9488_H_RES * LVGL_DRAW_BUF_LINES;
-    s_draw_buf_1 = heap_caps_malloc(pixel_count * sizeof(lv_color_t),
-                                    MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    ESP_RETURN_ON_FALSE(s_draw_buf_1 != NULL, ESP_ERR_NO_MEM, TAG, "lvgl draw buffer");
-
-    s_flush_buf = heap_caps_malloc(pixel_count * 3,
-                                   MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    ESP_RETURN_ON_FALSE(s_flush_buf != NULL, ESP_ERR_NO_MEM, TAG, "lvgl rgb666 buffer");
-
-    lv_disp_draw_buf_init(&s_draw_buf, s_draw_buf_1, NULL, pixel_count);
-
-    lv_disp_drv_init(&s_disp_drv);
-    s_disp_drv.hor_res = LCD_ILI9488_H_RES;
-    s_disp_drv.ver_res = LCD_ILI9488_V_RES;
-    s_disp_drv.flush_cb = lvgl_flush_cb;
-    s_disp_drv.draw_buf = &s_draw_buf;
-    lv_disp_drv_register(&s_disp_drv);
-
-    const esp_timer_create_args_t tick_timer_args = {
-        .callback = lvgl_tick_cb,
-        .name = "lvgl_tick",
-    };
-    ESP_RETURN_ON_ERROR(esp_timer_create(&tick_timer_args, &s_lvgl_tick_timer),
-                        TAG, "create lvgl tick");
-    return esp_timer_start_periodic(s_lvgl_tick_timer, LVGL_TICK_MS * 1000);
-}
-
-static void update_avatar_frame(uint32_t frame)
-{
-    static uint32_t last_frame = UINT32_MAX;
-    if (frame >= ARRAY_SIZE(s_avatar_frames) || frame == last_frame) {
+    s_tx_buf = heap_caps_malloc(LCD_ILI9488_H_RES * DIRECT_DRAW_LINES * 3,
+                                MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (!s_tx_buf) {
+        ESP_LOGE(TAG, "frame tx buffer allocation failed");
+        vTaskDelete(NULL);
         return;
     }
-    lv_img_set_src(s_avatar_frame_img, s_avatar_frames[frame]);
-    last_frame = frame;
-}
 
-static void animation_timer_cb(lv_timer_t *timer)
-{
-    (void)timer;
-    static const uint16_t frame_durations_ms[AVATAR_FRAME_COUNT] = {
-        420, 170, 170, 180, 180, 180, 120, 130, 170, 180, 180, 420,
-    };
-    static uint32_t frame;
-    static uint32_t elapsed_ms;
+    ESP_ERROR_CHECK_WITHOUT_ABORT(draw_rgb666_rect(0, 0,
+                                                  LCD_ILI9488_H_RES,
+                                                  LCD_ILI9488_V_RES,
+                                                  avatar_base_rgb666,
+                                                  LCD_ILI9488_H_RES,
+                                                  UINT32_MAX));
+#if ENABLE_AMBIENT_FX
+    draw_ambient_frame(0);
+#endif
 
-    elapsed_ms += ANIM_TIMER_MS;
-    while (elapsed_ms >= frame_durations_ms[frame]) {
-        elapsed_ms -= frame_durations_ms[frame];
-        frame = (frame + 1) % AVATAR_FRAME_COUNT;
+    size_t frame = 0;
+    uint32_t particle_tick = 0;
+#if ENABLE_AMBIENT_FX
+    size_t ambient_cursor = 0;
+#endif
+    while (1) {
+        TickType_t start = xTaskGetTickCount();
+
+#if ENABLE_AMBIENT_FX
+        size_t ambient_indices[AMBIENT_FX_PER_STEP];
+        for (size_t i = 0; i < AMBIENT_FX_PER_STEP; i++) {
+            size_t idx = (ambient_cursor + i) % AMBIENT_FX_COUNT;
+            ambient_indices[i] = idx;
+            esp_err_t restore_err = restore_ambient_fx(&s_ambient_fx[idx], s_ambient_ticks[idx]);
+            if (restore_err != ESP_OK) {
+                ESP_LOGW(TAG, "ambient restore %u failed: %s", (unsigned)idx, esp_err_to_name(restore_err));
+            }
+        }
+#endif
+
+        esp_err_t err = draw_rgb666_rect(AVATAR_HEAD_X, AVATAR_HEAD_Y,
+                                         AVATAR_HEAD_W, AVATAR_HEAD_H,
+                                         avatar_head_rgb666_frames[frame],
+                                         AVATAR_HEAD_W,
+                                         UINT32_MAX);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "draw frame %u failed: %s", (unsigned)frame, esp_err_to_name(err));
+        }
+
+#if ENABLE_LOWER_PARTICLES
+        if ((particle_tick % LOWER_PARTICLE_REFRESH_DIV) == 0) {
+            const uint8_t *lower_pixels = avatar_base_rgb666 +
+                                          (((size_t)LOWER_PARTICLE_Y * LCD_ILI9488_H_RES +
+                                            LOWER_PARTICLE_X) *
+                                           3);
+            err = draw_rgb666_rect(LOWER_PARTICLE_X, LOWER_PARTICLE_Y,
+                                   LOWER_PARTICLE_W, LOWER_PARTICLE_H,
+                                   lower_pixels, LCD_ILI9488_H_RES,
+                                   particle_tick);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "draw lower particles failed: %s", esp_err_to_name(err));
+            }
+        }
+#endif
+
+#if ENABLE_AMBIENT_FX
+        for (size_t i = 0; i < AMBIENT_FX_PER_STEP; i++) {
+            size_t idx = ambient_indices[i];
+            uint32_t next_tick = s_ambient_ticks[idx] + 1;
+            esp_err_t ambient_err = draw_ambient_fx(&s_ambient_fx[idx], next_tick);
+            if (ambient_err != ESP_OK) {
+                ESP_LOGW(TAG, "ambient fx %u failed: %s", (unsigned)idx, esp_err_to_name(ambient_err));
+            }
+            s_ambient_ticks[idx] = next_tick;
+        }
+        ambient_cursor = (ambient_cursor + AMBIENT_FX_PER_STEP) % AMBIENT_FX_COUNT;
+#endif
+
+        TickType_t elapsed = xTaskGetTickCount() - start;
+        TickType_t duration = pdMS_TO_TICKS(s_frame_durations_ms[frame]);
+        if (elapsed < duration) {
+            vTaskDelay(duration - elapsed);
+        } else {
+            vTaskDelay(1);
+        }
+
+        frame = (frame + 1) % AVATAR_HEAD_FRAME_COUNT;
+        particle_tick++;
     }
-
-    update_avatar_frame(frame);
-}
-
-static void create_ui(void)
-{
-    lv_obj_t *screen = lv_scr_act();
-    lv_obj_remove_style_all(screen);
-    lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_bg_color(screen, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
-
-    s_avatar_frame_img = lv_img_create(screen);
-    lv_img_set_src(s_avatar_frame_img, &avatar_frame_0);
-    lv_obj_set_pos(s_avatar_frame_img, AVATAR_FRAME_X, AVATAR_FRAME_Y);
-
-    lv_timer_create(animation_timer_cb, ANIM_TIMER_MS, NULL);
-    animation_timer_cb(NULL);
 }
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "ESP32-S3 ILI9488 LVGL full-screen companion animation");
-    ESP_LOGI(TAG, "LCD VCC=5V/3V3 GND=GND SCK=39 MOSI=38 MISO=40 CS=41 DC=42 RST=16 LED=2");
+    ESP_LOGI(TAG, "ESP32-S3 ILI9488 direct RGB666 animation");
+    ESP_LOGI(TAG, "LCD VCC=5V/3V3 GND=GND SCK=39 MOSI=38 MISO=unused CS=41 DC=42 RST=16 LED=2");
+    ESP_LOGI(TAG, "lower particles=%s ambient fx=%s", ENABLE_LOWER_PARTICLES ? "on" : "off",
+             ENABLE_AMBIENT_FX ? "on" : "off");
 
     ESP_ERROR_CHECK(lcd_ili9488_init());
-    ESP_ERROR_CHECK(lcd_ili9488_fill_screen_rgb565(0x0000));
-    ESP_ERROR_CHECK(lvgl_port_init());
-    create_ui();
 
-    while (1) {
-        lv_timer_handler();
-        vTaskDelay(pdMS_TO_TICKS(8));
-    }
+    BaseType_t ok = xTaskCreatePinnedToCore(animation_task,
+                                           "screen_anim",
+                                           ANIMATION_TASK_STACK,
+                                           NULL,
+                                           ANIMATION_TASK_PRIORITY,
+                                           NULL,
+                                           0);
+    ESP_ERROR_CHECK(ok == pdPASS ? ESP_OK : ESP_FAIL);
 }

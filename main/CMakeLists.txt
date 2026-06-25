@@ -2,23 +2,23 @@ idf_component_register(
     SRCS
         "main.c"
         "lcd_ili9488.c"
-        "avatar_frames.c"
+        "avatar_rgb666_frames.c"
     INCLUDE_DIRS "."
     EMBED_FILES
-        "avatar_frame_0.bin"
-        "avatar_frame_1.bin"
-        "avatar_frame_2.bin"
-        "avatar_frame_3.bin"
-        "avatar_frame_4.bin"
-        "avatar_frame_5.bin"
-        "avatar_frame_6.bin"
-        "avatar_frame_7.bin"
-        "avatar_frame_8.bin"
-        "avatar_frame_9.bin"
-        "avatar_frame_10.bin"
-        "avatar_frame_11.bin"
+        "avatar_base_rgb666.bin"
+        "avatar_head_rgb666_frame_0.bin"
+        "avatar_head_rgb666_frame_1.bin"
+        "avatar_head_rgb666_frame_2.bin"
+        "avatar_head_rgb666_frame_3.bin"
+        "avatar_head_rgb666_frame_4.bin"
+        "avatar_head_rgb666_frame_5.bin"
+        "avatar_head_rgb666_frame_6.bin"
+        "avatar_head_rgb666_frame_7.bin"
+        "avatar_head_rgb666_frame_8.bin"
+        "avatar_head_rgb666_frame_9.bin"
+        "avatar_head_rgb666_frame_10.bin"
+        "avatar_head_rgb666_frame_11.bin"
     REQUIRES
         driver
         esp_lcd
-        lvgl
 )
