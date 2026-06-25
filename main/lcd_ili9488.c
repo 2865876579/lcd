@@ -4,7 +4,6 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include "driver/gpio.h"
-#include "driver/ledc.h"
 #include "driver/spi_master.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
@@ -26,12 +25,6 @@
 #define LCD_PIN_DC GPIO_NUM_42
 #define LCD_PIN_RST GPIO_NUM_16
 #define LCD_PIN_BK_LIGHT GPIO_NUM_2
-#define LCD_BK_DEFAULT_PERCENT 28
-#define LCD_BK_PWM_FREQ_HZ 5000
-#define LCD_BK_PWM_MODE LEDC_LOW_SPEED_MODE
-#define LCD_BK_PWM_TIMER LEDC_TIMER_0
-#define LCD_BK_PWM_CHANNEL LEDC_CHANNEL_0
-#define LCD_BK_PWM_RESOLUTION LEDC_TIMER_10_BIT
 
 #define RGB565_RED 0xF800
 #define RGB565_GREEN 0x07E0
@@ -46,15 +39,6 @@ static const char *TAG = "ili9488";
 static esp_lcd_panel_io_handle_t s_lcd_io;
 static SemaphoreHandle_t s_color_done_sem;
 static bool s_lcd_ready;
-
-static uint32_t lcd_backlight_percent_to_duty(uint32_t percent)
-{
-    const uint32_t max_duty = (1U << 10) - 1U;
-    if (percent > 100U) {
-        percent = 100U;
-    }
-    return (percent * max_duty + 50U) / 100U;
-}
 
 static esp_err_t lcd_cmd(uint8_t cmd)
 {
@@ -153,34 +137,14 @@ static esp_err_t lcd_gpio_init(void)
     ESP_RETURN_ON_ERROR(gpio_config(&backlight_conf), TAG, "backlight gpio config");
 
     gpio_set_level(LCD_PIN_RST, 1);
-    gpio_set_level(LCD_PIN_BK_LIGHT, 0);
+    gpio_set_level(LCD_PIN_BK_LIGHT, 1);
     return ESP_OK;
 }
 
-static esp_err_t lcd_backlight_init(uint32_t percent)
+static esp_err_t lcd_backlight_init(void)
 {
-    const ledc_timer_config_t timer_config = {
-        .speed_mode = LCD_BK_PWM_MODE,
-        .duty_resolution = LCD_BK_PWM_RESOLUTION,
-        .timer_num = LCD_BK_PWM_TIMER,
-        .freq_hz = LCD_BK_PWM_FREQ_HZ,
-        .clk_cfg = LEDC_AUTO_CLK,
-    };
-    ESP_RETURN_ON_ERROR(ledc_timer_config(&timer_config), TAG, "backlight timer");
-
-    const ledc_channel_config_t channel_config = {
-        .gpio_num = LCD_PIN_BK_LIGHT,
-        .speed_mode = LCD_BK_PWM_MODE,
-        .channel = LCD_BK_PWM_CHANNEL,
-        .intr_type = LEDC_INTR_DISABLE,
-        .timer_sel = LCD_BK_PWM_TIMER,
-        .duty = lcd_backlight_percent_to_duty(percent),
-        .hpoint = 0,
-    };
-    ESP_RETURN_ON_ERROR(ledc_channel_config(&channel_config), TAG, "backlight channel");
-    ESP_RETURN_ON_ERROR(ledc_set_duty(LCD_BK_PWM_MODE, LCD_BK_PWM_CHANNEL, channel_config.duty),
-                        TAG, "backlight duty");
-    return ledc_update_duty(LCD_BK_PWM_MODE, LCD_BK_PWM_CHANNEL);
+    gpio_set_level(LCD_PIN_BK_LIGHT, 1);
+    return ESP_OK;
 }
 
 static esp_err_t lcd_spi_init(void)
@@ -271,14 +235,13 @@ esp_err_t lcd_ili9488_init(void)
     ESP_RETURN_ON_ERROR(lcd_spi_init(), TAG, "spi init");
     lcd_reset();
     ESP_RETURN_ON_ERROR(lcd_register_init(), TAG, "register init");
-    ESP_RETURN_ON_ERROR(lcd_backlight_init(LCD_BK_DEFAULT_PERCENT), TAG, "backlight init");
+    ESP_RETURN_ON_ERROR(lcd_backlight_init(), TAG, "backlight init");
 
     s_lcd_ready = true;
-    ESP_LOGI(TAG, "ready: %dx%d SCK=%d MOSI=%d MISO=%d CS=%d DC=%d RST=%d LED=%d BK=%u%%",
+    ESP_LOGI(TAG, "ready: %dx%d SCK=%d MOSI=%d MISO=%d CS=%d DC=%d RST=%d LED=%d BK=on",
              LCD_ILI9488_H_RES, LCD_ILI9488_V_RES,
              LCD_PIN_SCLK, LCD_PIN_MOSI, LCD_PIN_MISO,
-             LCD_PIN_CS, LCD_PIN_DC, LCD_PIN_RST, LCD_PIN_BK_LIGHT,
-             (unsigned)LCD_BK_DEFAULT_PERCENT);
+             LCD_PIN_CS, LCD_PIN_DC, LCD_PIN_RST, LCD_PIN_BK_LIGHT);
     return ESP_OK;
 }
 
