@@ -12,7 +12,7 @@
 #define DIRECT_DRAW_LINES 24
 #define ANIMATION_TASK_STACK 4096
 #define ANIMATION_TASK_PRIORITY 2
-#define ENABLE_LOWER_PARTICLES 1
+#define ENABLE_LOWER_PARTICLES 0
 #define LOWER_PARTICLE_X 30
 #define LOWER_PARTICLE_Y 270
 #define LOWER_PARTICLE_W 260
@@ -20,6 +20,11 @@
 #define LOWER_PARTICLE_REFRESH_DIV 3
 #define LOWER_PARTICLE_WAVE_PERIOD 128
 #define ENABLE_AMBIENT_FX 0
+#define ENABLE_AI_STATUS_PANEL 1
+#define STATUS_PANEL_X 0
+#define STATUS_PANEL_Y 426
+#define STATUS_PANEL_W LCD_ILI9488_H_RES
+#define STATUS_PANEL_H 34
 
 #if ENABLE_AMBIENT_FX
 #define AMBIENT_TILE_MAX 48
@@ -223,6 +228,152 @@ static esp_err_t draw_rgb666_rect(int x, int y, int w, int h,
     return ESP_OK;
 }
 
+#if ENABLE_AI_STATUS_PANEL
+static uint8_t status_clamp_rgb666(int value)
+{
+    if (value < 0) {
+        return 0;
+    }
+    if (value > 252) {
+        return 252;
+    }
+    return (uint8_t)(value & 0xFC);
+}
+
+static void status_blend_pixel(uint8_t *pixel, int r, int g, int b, int alpha)
+{
+    if (alpha <= 0) {
+        return;
+    }
+    if (alpha > 255) {
+        alpha = 255;
+    }
+
+    pixel[0] = status_clamp_rgb666(pixel[0] + (r - pixel[0]) * alpha / 255);
+    pixel[1] = status_clamp_rgb666(pixel[1] + (g - pixel[1]) * alpha / 255);
+    pixel[2] = status_clamp_rgb666(pixel[2] + (b - pixel[2]) * alpha / 255);
+}
+
+static const uint8_t s_status_cn_line1[10][11] = {
+    {0x12, 0x05, 0xF8, 0xBF, 0x24, 0x40, 0x00, 0x35, 0x01, 0x00, 0x06},
+    {0x36, 0x05, 0x08, 0xA1, 0x12, 0x80, 0x01, 0xC4, 0xBF, 0xFB, 0xB8},
+    {0x27, 0xE7, 0xF8, 0xFF, 0x07, 0xE0, 0x00, 0x44, 0x02, 0x02, 0xA0},
+    {0x64, 0x35, 0x0A, 0xA1, 0x74, 0x20, 0x01, 0xFF, 0xC4, 0x42, 0xA0},
+    {0xE9, 0x55, 0xFE, 0xBF, 0x97, 0xE0, 0x00, 0x44, 0x08, 0x42, 0xBF},
+    {0xA1, 0x05, 0x54, 0xAA, 0x96, 0xA0, 0x00, 0x7C, 0x8B, 0xF2, 0xA4},
+    {0x25, 0x85, 0xFC, 0xBF, 0x92, 0x80, 0x01, 0xC3, 0x18, 0x42, 0xA4},
+    {0x2D, 0x44, 0x98, 0x93, 0x16, 0x91, 0x00, 0x46, 0x68, 0x43, 0xA4},
+    {0x29, 0x24, 0x60, 0x8C, 0x1C, 0x92, 0x00, 0x5B, 0x48, 0x42, 0x44},
+    {0x27, 0x05, 0x9C, 0xB3, 0xB8, 0xF2, 0x01, 0xC1, 0x8F, 0xF8, 0x84},
+};
+
+static const uint8_t s_status_cn_line2[11][13] = {
+    {0x00, 0x02, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00, 0x00},
+    {0x0C, 0x3F, 0xF8, 0xA0, 0x29, 0x02, 0xF8, 0x18, 0x7D, 0xC0, 0x00, 0x08, 0x00},
+    {0xFF, 0xC2, 0x41, 0xA0, 0x49, 0x04, 0x89, 0xFF, 0x92, 0x40, 0x00, 0x0F, 0xC0},
+    {0x80, 0x4F, 0xF1, 0xFE, 0x7F, 0xE4, 0xF9, 0x00, 0xFE, 0x80, 0x00, 0x08, 0x00},
+    {0x3F, 0x08, 0x12, 0x20, 0x4A, 0x4A, 0x88, 0x30, 0x13, 0xE0, 0x00, 0xFF, 0x80},
+    {0x02, 0x0F, 0xF0, 0x20, 0xCA, 0x45, 0xFF, 0xFF, 0xFE, 0xAF, 0xFE, 0x80, 0x80},
+    {0x0C, 0x08, 0x13, 0xFF, 0xDD, 0x4C, 0x10, 0x82, 0x27, 0xF0, 0x00, 0xFF, 0x80},
+    {0xFF, 0xFF, 0xFC, 0x50, 0x55, 0x95, 0xFC, 0x84, 0x3C, 0xA0, 0x00, 0x00, 0x00},
+    {0x08, 0x05, 0x20, 0x51, 0x54, 0x84, 0x90, 0x78, 0x25, 0xE0, 0x00, 0xA4, 0x80},
+    {0x08, 0x1D, 0x3D, 0x91, 0x5D, 0x44, 0x10, 0x26, 0x3C, 0x80, 0x00, 0xB6, 0x40},
+    {0x38, 0x25, 0x66, 0x1F, 0x52, 0x24, 0x73, 0xC1, 0xAD, 0x80, 0x01, 0x12, 0x40},
+};
+
+static void status_draw_bitmap_line_chunk(uint8_t *buf, int width, int chunk_y, int lines,
+                                          int draw_x, int draw_y, int bitmap_w, int bitmap_h,
+                                          int row_bytes, const uint8_t *bitmap,
+                                          int r, int g, int b, int alpha)
+{
+    for (int gy = 0; gy < bitmap_h; gy++) {
+        const int py = draw_y + gy;
+        if (py < chunk_y || py >= chunk_y + lines) {
+            continue;
+        }
+        const uint8_t *src = bitmap + (size_t)gy * row_bytes;
+        for (int gx = 0; gx < bitmap_w; gx++) {
+            if ((src[gx >> 3] & (uint8_t)(0x80 >> (gx & 7))) == 0) {
+                continue;
+            }
+            const int px = draw_x + gx;
+            if (px < 0 || px >= width) {
+                continue;
+            }
+            uint8_t *pixel = &buf[(((size_t)(py - chunk_y) * width) + px) * 3];
+            status_blend_pixel(pixel, r, g, b, alpha);
+        }
+    }
+}
+
+static void status_draw_subtitle_line(uint8_t *buf, int width, int chunk_y, int lines,
+                                      int draw_x, int draw_y, int bitmap_w, int bitmap_h,
+                                      int row_bytes, const uint8_t *bitmap)
+{
+    static const int shadow_offsets[][2] = {
+        {-1, 0}, {1, 0}, {0, -1}, {0, 1}, {1, 1},
+    };
+
+    for (size_t i = 0; i < sizeof(shadow_offsets) / sizeof(shadow_offsets[0]); i++) {
+        status_draw_bitmap_line_chunk(buf, width, chunk_y, lines,
+                                      draw_x + shadow_offsets[i][0],
+                                      draw_y + shadow_offsets[i][1],
+                                      bitmap_w, bitmap_h, row_bytes, bitmap,
+                                      0, 0, 0, 210);
+    }
+
+    status_draw_bitmap_line_chunk(buf, width, chunk_y, lines,
+                                  draw_x, draw_y,
+                                  bitmap_w, bitmap_h, row_bytes, bitmap,
+                                  252, 252, 252, 255);
+}
+
+static void status_overlay_chunk(int chunk_y, int lines, uint32_t tick)
+{
+    (void)tick;
+    const int block_x = (STATUS_PANEL_W - 98) / 2;
+
+    status_draw_subtitle_line(s_tx_buf, STATUS_PANEL_W, chunk_y, lines,
+                              block_x + 5, 4,
+                              88, 10, (int)sizeof(s_status_cn_line1[0]),
+                              &s_status_cn_line1[0][0]);
+    status_draw_subtitle_line(s_tx_buf, STATUS_PANEL_W, chunk_y, lines,
+                              block_x, 18,
+                              98, 11, (int)sizeof(s_status_cn_line2[0]),
+                              &s_status_cn_line2[0][0]);
+}
+
+static esp_err_t draw_status_panel(uint32_t tick)
+{
+    for (int row = 0; row < STATUS_PANEL_H; row += DIRECT_DRAW_LINES) {
+        int lines = STATUS_PANEL_H - row;
+        if (lines > DIRECT_DRAW_LINES) {
+            lines = DIRECT_DRAW_LINES;
+        }
+
+        uint8_t *dst = s_tx_buf;
+        for (int line = 0; line < lines; line++) {
+            const uint8_t *src = avatar_base_rgb666 +
+                                 (((size_t)(STATUS_PANEL_Y + row + line) *
+                                   LCD_ILI9488_H_RES + STATUS_PANEL_X) *
+                                  3);
+            memcpy(dst, src, STATUS_PANEL_W * 3);
+            dst += STATUS_PANEL_W * 3;
+        }
+
+        status_overlay_chunk(row, lines, tick);
+        ESP_RETURN_ON_ERROR(lcd_ili9488_draw_rgb666_image(STATUS_PANEL_X,
+                                                          STATUS_PANEL_Y + row,
+                                                          STATUS_PANEL_W,
+                                                          lines,
+                                                          s_tx_buf),
+                            TAG, "draw status panel");
+    }
+
+    return ESP_OK;
+}
+#endif
+
 #if ENABLE_AMBIENT_FX
 static uint8_t clamp_rgb666(int value)
 {
@@ -377,9 +528,12 @@ static void animation_task(void *arg)
 #endif
 
     size_t frame = 0;
-    uint32_t particle_tick = 0;
+    uint32_t animation_tick = 0;
 #if ENABLE_AMBIENT_FX
     size_t ambient_cursor = 0;
+#endif
+#if ENABLE_AI_STATUS_PANEL
+    ESP_ERROR_CHECK_WITHOUT_ABORT(draw_status_panel(0));
 #endif
     while (1) {
         TickType_t start = xTaskGetTickCount();
@@ -406,7 +560,7 @@ static void animation_task(void *arg)
         }
 
 #if ENABLE_LOWER_PARTICLES
-        if ((particle_tick % LOWER_PARTICLE_REFRESH_DIV) == 0) {
+        if ((animation_tick % LOWER_PARTICLE_REFRESH_DIV) == 0) {
             const uint8_t *lower_pixels = avatar_base_rgb666 +
                                           (((size_t)LOWER_PARTICLE_Y * LCD_ILI9488_H_RES +
                                             LOWER_PARTICLE_X) *
@@ -414,7 +568,7 @@ static void animation_task(void *arg)
             err = draw_rgb666_rect(LOWER_PARTICLE_X, LOWER_PARTICLE_Y,
                                    LOWER_PARTICLE_W, LOWER_PARTICLE_H,
                                    lower_pixels, LCD_ILI9488_H_RES,
-                                   particle_tick);
+                                   animation_tick);
             if (err != ESP_OK) {
                 ESP_LOGE(TAG, "draw lower particles failed: %s", esp_err_to_name(err));
             }
@@ -443,7 +597,7 @@ static void animation_task(void *arg)
         }
 
         frame = (frame + 1) % AVATAR_HEAD_FRAME_COUNT;
-        particle_tick++;
+        animation_tick++;
     }
 }
 
@@ -451,8 +605,10 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "ESP32-S3 ILI9488 direct RGB666 animation");
     ESP_LOGI(TAG, "LCD VCC=5V/3V3 GND=GND SCK=39 MOSI=38 MISO=unused CS=41 DC=42 RST=16 LED=2");
-    ESP_LOGI(TAG, "lower particles=%s ambient fx=%s", ENABLE_LOWER_PARTICLES ? "on" : "off",
-             ENABLE_AMBIENT_FX ? "on" : "off");
+    ESP_LOGI(TAG, "lower particles=%s ambient fx=%s status panel=%s",
+             ENABLE_LOWER_PARTICLES ? "on" : "off",
+             ENABLE_AMBIENT_FX ? "on" : "off",
+             ENABLE_AI_STATUS_PANEL ? "on" : "off");
 
     ESP_ERROR_CHECK(lcd_ili9488_init());
 
